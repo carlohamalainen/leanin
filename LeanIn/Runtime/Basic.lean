@@ -187,12 +187,16 @@ worker's loop leaves only when the flag is set and it has nothing left to take. 
 @[expose] def Carriers.stop (c : Carriers cap) : IO Unit := c.e.stop
 
 /-- Wait for every carrier thread to exit. A worker that never returns makes this wait unbounded, which is
-stated rather than promised away — `BlockingPool.shutdownAndWait`'s existing wording. -/
+stated rather than promised away — `BlockingPool.shutdownAndWait`'s existing wording.
+
+The wake is so a pump parked on a deadline this run cancelled reaps it now and retires, rather than at its park's
+bound: a process can only exit once the pump has. -/
 def Carriers.join (c : Carriers cap) : IO Unit := do
   for t in c.threads do
     match ← IO.wait t with
     | .ok _    => pure ()
     | .error _ => pure ()
+  npUvWheelWake
 
 /-- How many carriers this capability started. -/
 def Carriers.count (c : Carriers cap) : Nat := c.threads.size

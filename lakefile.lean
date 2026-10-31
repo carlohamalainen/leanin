@@ -82,6 +82,10 @@ lean_exe queueScaling where
   root := `LeanIn.Exe.QueueScaling
   moreLinkArgs := netuvLinkArgs
 
+lean_exe pumpLifecycle where
+  root := `LeanIn.Exe.PumpLifecycle
+  moreLinkArgs := netuvLinkArgs
+
 lean_exe compatProbe where
   root := `LeanIn.Exe.CompatProbe
   moreLinkArgs := netuvLinkArgs

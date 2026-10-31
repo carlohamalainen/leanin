@@ -70,6 +70,10 @@
   while every operation copied the store. Anything unbounded held in a `Std.Mutex` or a global needs a case
   here, because a value stored in a shared cell is marked, a marked `Array` is never exclusive, and releasing the
   cell's own reference does not change that.
+- The pump's lifecycle: `nix develop -c bash tests/pump-lifecycle.sh` (timers re-armed around the pump's retirement,
+  a second run in one process, and a process not held open by a cancelled deadline, each under a watchdog, with a
+  stranded run as the watchdog's affirmative control). Retiring and `ensurePump` are one transaction on `pumpRef`,
+  and an arm must push before it calls `ensurePump`.
 - The stock-handler adapter has a pure check: `nix develop -c bash tests/compat-handler.sh`
   (a stock handler reads the buffered body, adds a header, and the adapter maps its response).
 - The `Std.Http`-shaped handler layer (`LeanIn/Http/StdHandler.lean`, D24) has socket scenarios in

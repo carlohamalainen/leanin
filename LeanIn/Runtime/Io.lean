@@ -186,7 +186,7 @@ structure Conn where
 /-- The pump thread, when one is driving the loop. A single-carrier driver (`Runtime.run`) drives the loop
 itself and starts none; the multi-carrier and virtual-clock entries (`Io.ensurePump`) start one, because their
 carriers park on the executor's condvar rather than on the loop. -/
-private initialize pumpRef : IO.Ref (Option (_root_.Task (Except IO.Error Unit))) ← IO.mkRef none
+private initialize pumpRef : Std.Mutex (Option (_root_.Task (Except IO.Error Unit))) ← Std.Mutex.new none
 
 /-- A timer the loop thread fires when it comes due: a monotone-nanosecond deadline, the token a winning read
 sets to disarm the loser, and the fire — the parked waiter's own continuation, enqueued on the shared route so
@@ -485,6 +485,17 @@ private partial def popDue (wheel : Std.TreeMap Nat (Array WheelTimer)) (now : N
     else (wheel, acc)
   | none => (wheel, acc)
 
+/-- Take off the front of the wheel every deadline whose timers are all cancelled. Such an entry fires nothing, so
+it must not be what the pump parks on or what keeps it alive: a won timeout leaves one for the full interval. Only
+the front is read, so a cancelled entry behind a live one waits for its turn. -/
+private partial def reapCancelled (wheel : Std.TreeMap Nat (Array WheelTimer)) (acc : Array WheelTimer) :
+    BaseIO (Std.TreeMap Nat (Array WheelTimer) × Array WheelTimer) := do
+  match wheel.minEntry? with
+  | some (d, ts) =>
+    if ← ts.allM (fun t => Task.Cancel.isSet t.cancel) then reapCancelled (wheel.erase d) (acc ++ ts)
+    else return (wheel, acc)
+  | none => return (wheel, acc)
+
 /-- **Is a listener bound?** Whether the loop has accepted connections whose final bytes it owes — the exit
 flush's condition. -/
 def hasListener : IO Bool := return (← loopRef.get).isSome
@@ -557,7 +568,8 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
   let due ← wheelRef.atomically do
     let w ← get
     let (w', due) := popDue w now #[]
-    set w'
+    let (w'', due) ← reapCancelled w' due
+    set w''
     return due
   for t in due do
     if ← Task.Cancel.isSet t.cancel then t.onCancel else t.fire
@@ -596,8 +608,10 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
     return false
   -- A single-carrier driver must return to its executor: its program can finish on another carrier,
   -- and a stop arrives from another thread, neither of which a poll blocked until a far timer would
-  -- observe. Bound its park; socket events and the wheel wake still cut it short.
-  let capMs : Nat := if ownedWorkOnly then 100 else 60000
+  -- observe. Bound its park; socket events and the wheel wake still cut it short. The pump is bounded as well,
+  -- because a wake only reaches a loop already inside its poll: a timer armed between the read above and the poll
+  -- waits for this cap, and so does a cancellation, which sends no wake at all.
+  let capMs : Nat := if ownedWorkOnly then 100 else 1000
   let timeoutMs : UInt32 := match nextDue with
     | some d => if d > now then (min capMs (max 1 ((d - now) / 1000000))).toUInt32 else 1
     -- With no deadline but raw work outstanding, block until an event: a raw completion is delivered by the
@@ -612,10 +626,21 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
   return active != 2
 
 /-- The pump thread's loop: drive until the loop is stopped or there is nothing left to drive, or until a
-single-carrier driver takes it over (`pumpQuitRef`). -/
+single-carrier driver takes it over (`pumpQuitRef`).
+
+**Retiring is a transaction with `ensurePump`.** A pump with nothing to drive clears `pumpRef` and exits, so the
+process can too, and the next arm starts another. The clear re-reads the hand-off under `pumpRef`'s lock: an arm
+pushes and then calls `ensurePump`, so either this read sees the timer and the pump stays, or `ensurePump` runs after
+the clear and starts a new one. -/
 private partial def pumpLoop : IO Unit := do
   if ← flagGet pumpQuitRef then pure ()
-  else if ← driveOnce false then pumpLoop else pure ()
+  else if ← driveOnce false then pumpLoop
+  else
+    let stay ← pumpRef.atomically do
+      if !(← timerPending.atomically do return (← get).isEmpty) then return true
+      set (none : Option (_root_.Task (Except IO.Error Unit)))
+      return false
+    if stay then pumpLoop
 
 /-- **Take the loop over for a single-carrier driver.** A pump thread started before the driver began — by the
 listener bind or a scheduled timer — is asked to yield (it exits without stopping the loop), and the driver flag
@@ -624,10 +649,10 @@ def takeover : IO Unit := do
   flagSet driverActiveRef true
   flagSet pumpQuitRef true
   npUvWheelWake
-  match ← pumpRef.get with
+  match ← pumpRef.atomically get with
   | some t =>
       let _ ← IO.wait t
-      pumpRef.set none
+      pumpRef.atomically (set (none : Option (_root_.Task (Except IO.Error Unit))))
   | none => pure ()
   flagSet pumpQuitRef false
 
@@ -641,11 +666,9 @@ the loop. No-op while a single-carrier driver is active or a pump is already run
 def ensurePump : IO Unit := do
   if ← flagGet driverActiveRef then pure ()
   else
-    match ← pumpRef.get with
-    | some _ => pure ()
-    | none   =>
-        let t ← IO.asTask pumpLoop _root_.Task.Priority.dedicated
-        pumpRef.set (some t)
+    pumpRef.atomically do
+      if (← get).isNone then
+        set (some (← IO.asTask pumpLoop _root_.Task.Priority.dedicated))
 
 /-- **Retire one timer by identity.** If it is still queued or wheeled it is removed and its cancellation
 continuation runs; if the driver has already taken it as due, the caller has set the token, so the driver runs
@@ -718,10 +741,10 @@ def stop : IO Unit := do
       -- An active single-carrier driver owns the loop and will drain it; the stopper must not
       -- drive a second pass on the same loop.
       if ← flagGet driverActiveRef then return
-      match ← pumpRef.get with
+      match ← pumpRef.atomically get with
       | some t =>
           let _ ← IO.wait t
-          pumpRef.set none
+          pumpRef.atomically (set (none : Option (_root_.Task (Except IO.Error Unit))))
       | none =>
           let mut active ← npUvRunOnceTimeout 0
           while active == 1 do
